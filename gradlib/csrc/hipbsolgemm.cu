@@ -62,11 +62,13 @@ namespace {
 /*thread_local*/ hipEvent_t event;
 
 // hipBLASLt
-hipblasLtHandle_t hipblaslt_handle;
-hipblasLtMatmulPreference_t preference;
+hipblasLtHandle_t hipblaslt_handle = nullptr;
+hipblasLtMatmulPreference_t preference = nullptr;
 size_t workspace_size = 2 * 128 * 1024 * 1024;
 // uint64_t workspace_size = 0;
-void* d_workspace;
+void* d_workspace = nullptr;
+constexpr size_t rmsnorm_handoff_buffer_size = 64 * 1024;
+void* d_rmsnorm_handoff_buffer = nullptr;
 int request_solutions = 1;
 int returnedAlgoCount = 0;
 
@@ -1379,14 +1381,19 @@ void hipb_create_extension()
     // CHECK_HIP_ERROR(hipEventCreateWithFlags(&event, cudaEventDisableTiming));
 
     // hipBLASLt
-    CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
-    CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
-    CHECK_HIPBLAS_ERROR(
-        hipblasLtMatmulPreferenceSetAttribute(preference,
-                                              HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                              &workspace_size,
-                                              sizeof(workspace_size)));
+    if(hipblaslt_handle == nullptr)
+        CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
+    hipb_get_workspace();
+    hipb_get_rmsnorm_handoff_buffer();
+    if(preference == nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
+        CHECK_HIPBLAS_ERROR(
+            hipblasLtMatmulPreferenceSetAttribute(preference,
+                                                  HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                  &workspace_size,
+                                                  sizeof(workspace_size)));
+    }
 
     // CHECK_HIP_ERROR(hipEventCreate(&start));
     // CHECK_HIP_ERROR(hipEventCreate(&stop));
@@ -1400,12 +1407,44 @@ void hipb_destroy_extension()
     // CHECK_HIP_ERROR(hipEventDestroy(event));
 
     // hipBLASLt
-    CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
-    CHECK_HIP_ERROR(hipFree(d_workspace));
+    if(hipblaslt_handle != nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
+        hipblaslt_handle = nullptr;
+    }
+    if(preference != nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
+        preference = nullptr;
+    }
+    if(d_workspace != nullptr)
+    {
+        CHECK_HIP_ERROR(hipFree(d_workspace));
+        d_workspace = nullptr;
+    }
+    if(d_rmsnorm_handoff_buffer != nullptr)
+    {
+        CHECK_HIP_ERROR(hipFree(d_rmsnorm_handoff_buffer));
+        d_rmsnorm_handoff_buffer = nullptr;
+    }
 
     // CHECK_HIP_ERROR(hipEventDestroy(start));
     // CHECK_HIP_ERROR(hipEventDestroy(stop));
+}
+
+std::pair<void*, size_t> hipb_get_workspace()
+{
+    if(d_workspace == nullptr)
+        CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size));
+    return {d_workspace, workspace_size};
+}
+
+std::pair<void*, size_t> hipb_get_rmsnorm_handoff_buffer()
+{
+    if(d_rmsnorm_handoff_buffer == nullptr)
+        CHECK_HIP_ERROR(
+            hipMalloc(&d_rmsnorm_handoff_buffer, rmsnorm_handoff_buffer_size));
+    return {d_rmsnorm_handoff_buffer, rmsnorm_handoff_buffer_size};
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1450,7 +1489,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("bpreshuffle") = false,
           py::arg("use_gelu")    = false);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
+    bind_hipb_mm_epilogue_mm(m);
 }
-
-
 

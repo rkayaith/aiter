@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "hipbsolgemm.cuh"
+
 #include <pybind11/pybind11.h>
 #include <torch/all.h>
 #include <torch/csrc/utils/pybind.h>
@@ -16,6 +18,8 @@
 #include <unordered_map>
 
 namespace py = pybind11;
+
+#ifdef CUSTOM_HIPBLASLT_PATH
 
 #define CHECK_HIPBLAS(expr)                                                             \
     do {                                                                                \
@@ -34,11 +38,6 @@ namespace py = pybind11;
 // BOTH the compile-time flags (-I, -L, -rpath, -DCUSTOM_HIPBLASLT_PATH,
 // injected by optCompilerConfig.json) AND the runtime dlopen path used by
 // getHipblasltPath below.
-#ifndef CUSTOM_HIPBLASLT_PATH
-#  define CUSTOM_HIPBLASLT_PATH \
-    "libhipblaslt.so.1"
-#endif
-
 static std::string getHipblasltPath()
 {
     const char* env = std::getenv("AITER_HIPBLASLT_PATH");
@@ -91,6 +90,8 @@ using pfnFusedEpilogueDestroy =
     hipblasStatus_t (*)(hipblasLtFusedEpilogueDescriptor_t);
 using pfnFusedEpilogueRMSNormDescriptorCreate =
     hipblasStatus_t (*)(hipblasLtFusedEpilogueRMSNormDescriptor_t*);
+using pfnFusedEpilogueRMSNormDescriptorSetBuffer =
+    hipblasStatus_t (*)(hipblasLtFusedEpilogueRMSNormDescriptor_t, void*, size_t);
 using pfnFusedEpilogueRMSNormDescriptorDestroy =
     hipblasStatus_t (*)(hipblasLtFusedEpilogueRMSNormDescriptor_t);
 
@@ -113,9 +114,10 @@ struct HbltVtable {
     pfnFusedEpilogueCreate                   fusedEpilogueCreate;
     pfnFusedEpilogueAdd                      fusedEpilogueAdd;
     pfnFusedEpilogueSetAttribute             fusedEpilogueSetAttribute;
-    pfnFusedEpilogueDestroy                  fusedEpilogueDestroy;
-    pfnFusedEpilogueRMSNormDescriptorCreate  rmsNormDescCreate;
-    pfnFusedEpilogueRMSNormDescriptorDestroy rmsNormDescDestroy;
+    pfnFusedEpilogueDestroy                    fusedEpilogueDestroy;
+    pfnFusedEpilogueRMSNormDescriptorCreate    rmsNormDescCreate;
+    pfnFusedEpilogueRMSNormDescriptorSetBuffer rmsNormDescSetBuffer;
+    pfnFusedEpilogueRMSNormDescriptorDestroy   rmsNormDescDestroy;
 
     template<typename F>
     F loadSym(const char* name) const
@@ -151,6 +153,8 @@ struct HbltVtable {
         fusedEpilogueDestroy         = loadSym<pfnFusedEpilogueDestroy>("hipblasLtFusedEpilogueDestroy");
         rmsNormDescCreate            = loadSym<pfnFusedEpilogueRMSNormDescriptorCreate>(
             "hipblasLtFusedEpilogueRMSNormDescriptorCreate");
+        rmsNormDescSetBuffer          = loadSym<pfnFusedEpilogueRMSNormDescriptorSetBuffer>(
+            "hipblasLtFusedEpilogueRMSNormDescriptorSetBuffer");
         rmsNormDescDestroy           = loadSym<pfnFusedEpilogueRMSNormDescriptorDestroy>(
             "hipblasLtFusedEpilogueRMSNormDescriptorDestroy");
     }
@@ -219,24 +223,6 @@ static hipblasLtHandle_t getHandle(int deviceIndex)
             throw std::runtime_error("failed to create hipblaslt handle");
     }
     return handle;
-}
-
-// Returns a pointer to a persistent, lazily-grown device workspace.
-// The buffer lives for the lifetime of the process and is never freed, so
-// hipblaslt can reuse it across calls without hitting the PyTorch allocator.
-static std::pair<void*, size_t> getWorkspace(at::Device device)
-{
-    // 256 MB is the ceiling hipblaslt currently needs for fused-epilogue solutions.
-    static constexpr size_t kWsSize = static_cast<size_t>(256) * 1024 * 1024;
-    static std::mutex mtx;
-    static std::unordered_map<int, torch::Tensor> workspaces;
-    std::lock_guard<std::mutex> lock(mtx);
-    const int deviceIndex = static_cast<int>(device.index());
-    torch::Tensor& ws = workspaces[deviceIndex];
-    if (!ws.defined())
-        ws = torch::empty({static_cast<int64_t>(kWsSize)},
-                          torch::TensorOptions().dtype(torch::kUInt8).device(device));
-    return {ws.data_ptr(), kWsSize};
 }
 
 // Generalized configureMatmulLayouts with typed A/B/CD element types.
@@ -587,6 +573,14 @@ torch::Tensor hipb_mm_epilogue_mm(
 
     const c10::hip::OptionalHIPGuardMasqueradingAsCUDA deviceGuard{A.device()};
     const hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
+    auto [rmsNormHandoff, rmsNormHandoffSize] = hipb_get_rmsnorm_handoff_buffer();
+    const size_t requiredRmsNormHandoffSize = static_cast<size_t>(mTok) * sizeof(float);
+    TORCH_CHECK(requiredRmsNormHandoffSize <= rmsNormHandoffSize,
+                "RMSNorm handoff buffer is too small: requires ",
+                requiredRmsNormHandoffSize,
+                " bytes, but the process buffer has ",
+                rmsNormHandoffSize,
+                " bytes");
     auto intermediateOptions = torch::TensorOptions().dtype(producerOutDtype).device(A.device());
     torch::Tensor intermediate = torch::empty({mTok, nHid}, intermediateOptions);
 
@@ -599,11 +593,13 @@ torch::Tensor hipb_mm_epilogue_mm(
         output = torch::empty({nOut, mTok}, outputOptions).transpose(0, 1);
     }
 
-    auto [workspace, workspaceSize] = getWorkspace(A.device());
+    auto [workspace, workspaceSize] = hipb_get_workspace();
     const HbltVtable& v = HbltVtable::get();
     hipblasLtHandle_t handle = getHandle(static_cast<int>(A.device().index()));
     RmsNormStatsGuard stats;
     CHECK_HIPBLAS(v.rmsNormDescCreate(&stats.handle));
+    CHECK_HIPBLAS(v.rmsNormDescSetBuffer(
+        stats.handle, rmsNormHandoff, rmsNormHandoffSize));
 
     void* residualPtr = residual ? residual->data_ptr() : nullptr;
     void* residualOutputPtr = residualOut ? residualOut->data_ptr() : nullptr;
@@ -668,7 +664,37 @@ torch::Tensor hipb_mm_epilogue_mm(
     return output;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+#else
+
+torch::Tensor hipb_mm_epilogue_mm(
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    std::vector<int64_t>,
+    std::optional<torch::Tensor>,
+    std::optional<torch::Tensor>,
+    torch::Tensor,
+    double,
+    std::optional<torch::Tensor>,
+    int64_t,
+    c10::ScalarType,
+    c10::ScalarType,
+    std::optional<torch::Tensor>,
+    std::optional<torch::Tensor>,
+    std::optional<torch::Tensor>,
+    std::optional<torch::Tensor>,
+    std::optional<int64_t>,
+    std::optional<int64_t>)
+{
+    PyErr_SetString(
+        PyExc_NotImplementedError,
+        "hipb_mm_epilogue_mm requires AITER_HIPBLASLT_PATH at build time");
+    throw py::error_already_set();
+}
+
+#endif
+
+void bind_hipb_mm_epilogue_mm(py::module_& m)
 {
     m.def("hipb_mm_epilogue_mm",
           &hipb_mm_epilogue_mm,

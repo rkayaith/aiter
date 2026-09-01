@@ -15,7 +15,7 @@ from aiter.ops.gemm_rmsnorm_gemm import (
 )
 
 
-def test_hipb_mm_epilogue_mm_bf16_model_sequence():
+def test_hipb_mm_epilogue_mm_bf16_model_sequence_cudagraph():
     eps = 1e-6
     m, k, n = 1, 256, 256
     input = torch.zeros(m, k, dtype=torch.bfloat16, device="cuda")
@@ -26,16 +26,28 @@ def test_hipb_mm_epilogue_mm_bf16_model_sequence():
     weight1 = torch.eye(n, dtype=torch.bfloat16, device="cuda")
     gemm_out = torch.empty(n, m, dtype=torch.bfloat16, device="cuda").T
 
-    output = hipb_mm_epilogue_mm(
-        input,
-        weight0,
-        weight1,
-        stages=(
-            ResidualAdd(residual=residual, residual_out=residual_out),
-            RMSNorm(gamma=gamma, eps=eps),
-        ),
-        gemm_out=gemm_out,
-    )
+    def run():
+        return hipb_mm_epilogue_mm(
+            input,
+            weight0,
+            weight1,
+            stages=(
+                ResidualAdd(residual=residual, residual_out=residual_out),
+                RMSNorm(gamma=gamma, eps=eps),
+            ),
+            gemm_out=gemm_out,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    graph.replay()
     torch.cuda.synchronize()
 
     expected_residual = torch.ones_like(residual)
@@ -107,6 +119,22 @@ def test_hipb_mm_epilogue_mm_rejects_unsupported_producer_storage_dtype():
             weight1,
             stages=(RMSNorm(gamma=gamma, eps=1e-6),),
             producer_out_dtype=torch.float32,
+        )
+
+
+def test_hipb_mm_epilogue_mm_rejects_oversized_rmsnorm_handoff():
+    m, k, n = 16385, 256, 256
+    input = torch.zeros(m, k, dtype=torch.bfloat16, device="cuda")
+    weight0 = torch.zeros(n, k, dtype=torch.bfloat16, device="cuda")
+    gamma = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+    weight1 = torch.eye(n, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(RuntimeError, match="RMSNorm handoff buffer is too small"):
+        hipb_mm_epilogue_mm(
+            input,
+            weight0,
+            weight1,
+            stages=(RMSNorm(gamma=gamma, eps=1e-6),),
         )
 
 

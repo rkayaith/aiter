@@ -59,7 +59,7 @@ def _require_gfx950():
 
 
 @compile_ops(
-    "module_gemm_rmsnorm_gemm",
+    "module_hipbsolgemm",
     fc_name="hipb_mm_epilogue_mm",
     ffi_type="pybind",
 )

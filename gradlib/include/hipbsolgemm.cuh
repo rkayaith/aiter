@@ -35,9 +35,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <utility>
+
 void hipb_create_extension();
 
 void hipb_destroy_extension();
+
+std::pair<void*, size_t> hipb_get_workspace();
+
+std::pair<void*, size_t> hipb_get_rmsnorm_handoff_buffer();
+
+void bind_hipb_mm_epilogue_mm(pybind11::module_& m);
 
 torch::Tensor hipb_mm(const torch::Tensor& mat1,
                       const torch::Tensor& mat2,
@@ -89,5 +97,3 @@ hipblasStatus_t hipblasLt_online_tuning(
     std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults,
     size_t size_dA, size_t size_dB, size_t size_dC, int64_t totalRotatingSizeNeeded, hipDataType intype, hipDataType outtype,
     hipStream_t stream);
-
-
