@@ -242,5 +242,23 @@ def test_hipb_mm_accepts_mxfp8_scale_dtype(mode, scale_dtype):
     torch.cuda.synchronize()
 
 
+def test_hipb_mm_epilogue_mm_unavailable():
+    if get_module("module_hipbsolgemm").hipblaslt_build_version >= (1, 5, 0):
+        pytest.skip("requires hipBLASLt < 1.5.0")
+    x = torch.zeros((1, 256), device="cuda", dtype=dtypes.bf16)
+    w = torch.zeros((256, 256), device="cuda", dtype=dtypes.bf16).t()
+    with pytest.raises(
+        RuntimeError, match="requires a hipBLASLt build with the fused epilogue API"
+    ):
+        aiter.hipb_mm_epilogue_mm(
+            x,
+            w,
+            w,
+            stages=(),
+            intermediate_dtype=dtypes.bf16,
+            dtype=dtypes.bf16,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

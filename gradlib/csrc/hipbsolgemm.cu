@@ -100,6 +100,12 @@ size_t workspace_size = 2 * 128 * 1024 * 1024;
 void* d_workspace;
 // One resource set per module. Lifecycle calls retain the Python GIL.
 int extension_device  = -1;
+// TODO: Update these version guards once the fused epilogue API is a released feature.
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 5)
+// One float per output row; 64 KiB covers up to 16,384 rows without capture-time allocation.
+constexpr size_t rmsnorm_handoff_buffer_size = 64 * 1024;
+void* d_rmsnorm_handoff_buffer = nullptr;
+#endif
 int request_solutions = 1;
 int returnedAlgoCount = 0;
 
@@ -1511,6 +1517,522 @@ std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 5)
+namespace {
+
+bool has_stage(const std::vector<int64_t>& stage_kinds, hipblasLtFuseableEpilogue_t stage)
+{
+    return std::find(stage_kinds.begin(), stage_kinds.end(), static_cast<int64_t>(stage)) !=
+           stage_kinds.end();
+}
+
+void configure_tn_fused_matmul(hipDataType a_type,
+                               hipDataType b_type,
+                               hipDataType output_type,
+                               int64_t m,
+                               int64_t n,
+                               int64_t k,
+                               hipblasLtFusedEpilogueDescriptor_t fused_epilogue,
+                               hipblasLtMatrixLayout_t& layout_a,
+                               hipblasLtMatrixLayout_t& layout_b,
+                               hipblasLtMatrixLayout_t& layout_c,
+                               hipblasLtMatmulDesc_t& matmul)
+{
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&layout_a, a_type, k, m, k));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&layout_b, b_type, k, n, k));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&layout_c, output_type, m, n, m));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+
+    const hipblasOperation_t transpose_a = HIPBLAS_OP_T;
+    const hipblasOperation_t transpose_b = HIPBLAS_OP_N;
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &transpose_a, sizeof(transpose_a)));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &transpose_b, sizeof(transpose_b)));
+    if(fused_epilogue != nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_FUSED_EPILOGUE, &fused_epilogue, sizeof(fused_epilogue)));
+    }
+}
+
+hipblasStatus_t run_tn_fused(hipDataType a_type,
+                             hipDataType b_type,
+                             hipDataType output_type,
+                             int64_t m,
+                             int64_t n,
+                             int64_t k,
+                             const void* a,
+                             const void* scale_a,
+                             const void* b,
+                             const void* scale_b,
+                             void* c,
+                             void* d,
+                             hipblasLtFusedEpilogueDescriptor_t fused_epilogue,
+                             hipStream_t stream,
+                             std::optional<int64_t> solution_index,
+                             std::optional<int64_t> scale_a_mode,
+                             std::optional<int64_t> scale_b_mode)
+{
+    hipblasLtMatrixLayout_t layout_a, layout_b, layout_c;
+    hipblasLtMatmulDesc_t matmul;
+    configure_tn_fused_matmul(
+        a_type, b_type, output_type, m, n, k, fused_epilogue, layout_a, layout_b, layout_c, matmul);
+    if(scale_a_mode.has_value())
+    {
+        const auto mode = static_cast<hipblasLtMatmulMatrixScale_t>(*scale_a_mode);
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)));
+    }
+    if(scale_a != nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a, sizeof(scale_a)));
+    }
+    if(scale_b_mode.has_value())
+    {
+        const auto mode = static_cast<hipblasLtMatmulMatrixScale_t>(*scale_b_mode);
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)));
+    }
+    if(scale_b != nullptr)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(scale_b)));
+    }
+
+    std::vector<hipblasLtMatmulHeuristicResult_t> heuristic_result(1);
+    if(solution_index.has_value())
+    {
+        std::vector<int> algorithm_index{static_cast<int>(*solution_index)};
+        CHECK_HIPBLAS_ERROR(
+            hipblaslt_ext::getAlgosFromIndex(hipblaslt_handle, algorithm_index, heuristic_result));
+    }
+    else
+    {
+        int algorithm_count = 0;
+        CHECK_HIPBLAS_ERROR(
+            hipblasLtMatmulAlgoGetHeuristic(hipblaslt_handle,
+                                            matmul,
+                                            layout_a,
+                                            layout_b,
+                                            layout_c,
+                                            layout_c,
+                                            preference,
+                                            /*requestedAlgoCount=*/1,
+                                            heuristic_result.data(),
+                                            &algorithm_count));
+        if(algorithm_count == 0)
+        {
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_a));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_b));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_c));
+            AITER_CHECK(false, "hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions");
+        }
+    }
+
+    const float alpha            = 1.0f;
+    const float beta             = 0.0f;
+    const hipblasStatus_t status = hipblasLtMatmul(hipblaslt_handle,
+                                                   matmul,
+                                                   &alpha,
+                                                   a,
+                                                   layout_a,
+                                                   b,
+                                                   layout_b,
+                                                   &beta,
+                                                   c,
+                                                   layout_c,
+                                                   d,
+                                                   layout_c,
+                                                   &heuristic_result.front().algo,
+                                                   d_workspace,
+                                                   workspace_size,
+                                                   stream);
+
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_a));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_b));
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(layout_c));
+    return status;
+}
+
+void build_producer_epilogue(const std::vector<int64_t>& stage_kinds,
+                             void* residual,
+                             void* residual_out,
+                             void* gamma,
+                             float eps,
+                             void* requant_scale_out,
+                             int64_t requant_scale_mode,
+                             hipDataType requant_output_type,
+                             hipblasLtFusedEpilogueRMSNormDescriptor_t stats,
+                             hipblasLtFusedEpilogueDescriptor_t& producer)
+{
+    CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueCreate(&producer));
+    const bool has_requant = has_stage(stage_kinds, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT);
+    const auto scale_mode  = static_cast<hipblasLtMatmulMatrixScale_t>(requant_scale_mode);
+    const bool mx_requant =
+        has_requant && scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+
+    for(const int64_t stage_kind : stage_kinds)
+    {
+        const auto stage = static_cast<hipblasLtFuseableEpilogue_t>(stage_kind);
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueAdd(producer, stage));
+        switch(stage)
+        {
+        case HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD:
+            CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                producer, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &residual, sizeof(residual)));
+            if(residual_out != nullptr)
+            {
+                const hipblasLtFusedEpilogueAttribute_t output_attribute =
+                    mx_requant ? HIPBLASLT_FUSED_EPILOGUE_REQUANT_MX_RESIDUAL_OUT_POINTER
+                               : HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER;
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer, output_attribute, &residual_out, sizeof(residual_out)));
+            }
+            break;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS:
+            CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                producer, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &gamma, sizeof(gamma)));
+            CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                producer, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_EPS, &eps, sizeof(eps)));
+            CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                producer, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS, &stats, sizeof(stats)));
+            break;
+        case HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT: {
+            switch(scale_mode)
+            {
+            case HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT: {
+                const hipblasLtRequantScaleComputeMode_t compute_mode =
+                    HIPBLASLT_REQUANT_SCALE_DYNAMIC_FROM_AMAX;
+                const hipblasLtRequantScaleGranularity_t granularity =
+                    HIPBLASLT_REQUANT_SCALE_PER_BLOCK_MX;
+                const int32_t block_size = 32;
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer,
+                    HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_COMPUTE_MODE,
+                    &compute_mode,
+                    sizeof(compute_mode)));
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer,
+                    HIPBLASLT_FUSED_EPILOGUE_REQUANT_SCALE_GRANULARITY,
+                    &granularity,
+                    sizeof(granularity)));
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer,
+                    HIPBLASLT_FUSED_EPILOGUE_REQUANT_MX_SCALE_POINTER,
+                    &requant_scale_out,
+                    sizeof(requant_scale_out)));
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer,
+                    HIPBLASLT_FUSED_EPILOGUE_REQUANT_MX_BLOCK_SIZE,
+                    &block_size,
+                    sizeof(block_size)));
+                CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueSetAttribute(
+                    producer,
+                    HIPBLASLT_FUSED_EPILOGUE_REQUANT_MX_OUTPUT_TYPE,
+                    &requant_output_type,
+                    sizeof(requant_output_type)));
+                break;
+            }
+            default: AITER_CHECK(false, "Requant does not support scale_mode ", requant_scale_mode);
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
+void validate_output(const aiter_tensor_t& output,
+                     int64_t rows,
+                     int64_t columns,
+                     int device_id,
+                     bool column_major,
+                     const char* name)
+{
+    AITER_CHECK(output.is_gpu(), name, " must be a GPU tensor");
+    AITER_CHECK(output.device_id == device_id, name, " must be on the mat1 device");
+    AITER_CHECK(output.dim() == 2 && output.size(0) == rows && output.size(1) == columns,
+                name,
+                " has the wrong shape");
+    if(column_major)
+    {
+        AITER_CHECK(output.stride(1) == rows && (rows == 1 || output.stride(0) == 1),
+                    name,
+                    " must use the native column-major [M, N] layout");
+    }
+    else
+    {
+        AITER_CHECK(output.is_contiguous(), name, " must be contiguous");
+    }
+}
+
+void validate_operand_scale(const std::optional<aiter_tensor_t>& scale,
+                            std::optional<int64_t> mode,
+                            int64_t operand_rows,
+                            int64_t operand_k,
+                            int device_id,
+                            const char* name)
+{
+    AITER_CHECK(!mode.has_value() || scale.has_value(), name, " mode requires a scale tensor");
+    if(!scale.has_value())
+        return;
+
+    AITER_CHECK(scale->is_gpu() && scale->device_id == device_id,
+                name,
+                " must be a GPU tensor on the operand device");
+    AITER_CHECK(scale->is_contiguous(), name, " must be contiguous");
+
+    const auto effective_mode = static_cast<hipblasLtMatmulMatrixScale_t>(
+        mode.value_or(HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F));
+    validate_hipb_operand_scale(
+        *scale, effective_mode, operand_rows, operand_k, device_id, name);
+}
+
+} // namespace
+#endif
+
+void hipb_mm_epilogue_mm(const aiter_tensor_t& mat1,
+                         const aiter_tensor_t& mat2,
+                         const aiter_tensor_t& mat3,
+                         const std::vector<int64_t>& stage_kinds,
+                         std::optional<aiter_tensor_t> residual,
+                         std::optional<aiter_tensor_t> residual_out,
+                         std::optional<aiter_tensor_t> gamma,
+                         double eps,
+                         std::optional<aiter_tensor_t> requant_scale_out,
+                         int64_t requant_scale_mode,
+                         aiter_tensor_t& intermediate,
+                         aiter_tensor_t& gemm_out,
+                         std::optional<aiter_tensor_t> mat1_scale,
+                         std::optional<aiter_tensor_t> mat2_scale,
+                         std::optional<aiter_tensor_t> mat3_scale,
+                         std::optional<int64_t> mat1_scale_mode,
+                         std::optional<int64_t> mat2_scale_mode,
+                         std::optional<int64_t> mat3_scale_mode,
+                         std::optional<int64_t> solution_index1,
+                         std::optional<int64_t> solution_index2)
+{
+    aiter_detail::g_aiter_can_throw = true;
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 5)
+    AITER_CHECK(extension_device != -1,
+                "hipb_create_extension must be called before hipb_mm_epilogue_mm");
+    AITER_CHECK(extension_device == mat1.device_id,
+                "hipBLASLt extension is initialized on device ",
+                extension_device,
+                "; mat1 is on device ",
+                mat1.device_id,
+                "; destroy it before initializing on another device");
+
+    // Operation:
+    //   GEMM1: mat1 [m, k1] (row-major) @ mat2 [k1, k2] (column-major)
+    //          -> intermediate [m, k2] (row-major).
+    //   GEMM2: intermediate [m, k2] (row-major) @ mat3 [k2, n] (column-major)
+    //          -> gemm_out [m, n] (row-major).
+    // hipBLASLt emits the row-major outputs through the transposed products:
+    //   mat2^T @ mat1^T = intermediate^T; mat3^T @ intermediate^T = gemm_out^T.
+
+    AITER_CHECK(mat1.is_gpu() && mat2.is_gpu() && mat3.is_gpu(),
+                "mat1, mat2, and mat3 must be GPU tensors");
+    AITER_CHECK(mat1.device_id == mat2.device_id && mat1.device_id == mat3.device_id,
+                "mat1, mat2, and mat3 must be on the same device");
+    AITER_CHECK(mat1.dim() == 2 && mat2.dim() == 2 && mat3.dim() == 2,
+                "mat1, mat2, and mat3 must be two-dimensional");
+    AITER_CHECK(mat1.is_contiguous(), "mat1 must use row-major contiguous layout");
+    AITER_CHECK(mat2.stride(0) == 1 && mat2.stride(1) == std::max<int64_t>(1, mat2.size(0)),
+                "mat2 must use column-major layout");
+    AITER_CHECK(mat3.stride(0) == 1 && mat3.stride(1) == std::max<int64_t>(1, mat3.size(0)),
+                "mat3 must use column-major layout");
+
+    const int64_t m  = mat1.size(0);
+    const int64_t k1 = mat1.size(1);
+    const int64_t k2 = mat2.size(1);
+    const int64_t n  = mat3.size(1);
+    AITER_CHECK(mat2.size(0) == k1, "mat2 rows must equal mat1 columns");
+    AITER_CHECK(mat3.size(0) == k2, "mat3 rows must equal mat2 columns");
+
+    const hipDataType mat1_type         = aiter_to_hip_dtype(mat1.dtype());
+    const hipDataType mat2_type         = aiter_to_hip_dtype(mat2.dtype());
+    const hipDataType mat3_type         = aiter_to_hip_dtype(mat3.dtype());
+    const hipDataType intermediate_type = aiter_to_hip_dtype(intermediate.dtype());
+    const hipDataType gemm_out_type     = aiter_to_hip_dtype(gemm_out.dtype());
+    validate_output(intermediate, m, k2, mat1.device_id, false, "intermediate");
+    validate_output(gemm_out, m, n, mat1.device_id, false, "gemm_out");
+    validate_operand_scale(mat1_scale, mat1_scale_mode, m, k1, mat1.device_id, "mat1_scale");
+    validate_operand_scale(mat2_scale, mat2_scale_mode, k2, k1, mat1.device_id, "mat2_scale");
+    validate_operand_scale(mat3_scale, mat3_scale_mode, n, k2, mat1.device_id, "mat3_scale");
+
+    const bool has_requant = has_stage(stage_kinds, HIPBLASLT_FUSEABLE_EPILOGUE_REQUANT);
+    if(has_requant)
+    {
+        AITER_CHECK(requant_scale_out.has_value(), "Requant requires a scale_out tensor");
+        AITER_CHECK(requant_scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT,
+                    "Requant does not support scale_mode ",
+                    requant_scale_mode);
+        validate_operand_scale(requant_scale_out,
+                               std::make_optional(requant_scale_mode),
+                               m,
+                               k2,
+                               mat1.device_id,
+                               "Requant.scale_out");
+    }
+
+    const bool has_residual_add = has_stage(stage_kinds, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD);
+    AITER_CHECK(!has_residual_add || residual.has_value(),
+                "ResidualAdd requires a residual tensor");
+    AITER_CHECK(!has_residual_add || residual_out.has_value(),
+                "ResidualAdd requires a residual_out tensor; the AITER API does not expose "
+                "hipBLASLt's optional in-place residual update");
+
+    if(gamma.has_value())
+    {
+        AITER_CHECK(gamma->is_gpu() && gamma->device_id == mat1.device_id,
+                    "gamma must be a GPU tensor on the mat1 device");
+        AITER_CHECK(gamma->dim() == 1 && gamma->size(0) == k2,
+                    "gamma length must equal mat2 columns");
+        AITER_CHECK(gamma->is_contiguous(), "gamma must be contiguous");
+    }
+
+    if(residual.has_value())
+    {
+        AITER_CHECK(residual->is_gpu() && residual->device_id == mat1.device_id,
+                    "residual must be a GPU tensor on the mat1 device");
+        AITER_CHECK(residual->dim() == 2 && residual->size(0) == m && residual->size(1) == k2,
+                    "residual must have shape [M, K2]");
+        AITER_CHECK(residual->is_contiguous(), "residual must be contiguous");
+    }
+    if(residual_out.has_value())
+    {
+        AITER_CHECK(residual_out->is_gpu() && residual_out->device_id == mat1.device_id,
+                    "residual_out must be a GPU tensor on the mat1 device");
+        AITER_CHECK(residual_out->dim() == 2 && residual_out->size(0) == m &&
+                        residual_out->size(1) == k2,
+                    "residual_out must have shape [M, K2]");
+        AITER_CHECK(residual_out->is_contiguous(), "residual_out must be contiguous");
+    }
+    const HipDeviceGuard device_guard(mat1.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    const bool has_rmsnorm =
+        has_stage(stage_kinds, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS);
+    hipblasLtFusedEpilogueRMSNormDescriptor_t stats_descriptor = nullptr;
+    if(has_rmsnorm)
+    {
+        const size_t required_handoff_size = static_cast<size_t>(m) * sizeof(float);
+        AITER_CHECK(required_handoff_size <= rmsnorm_handoff_buffer_size,
+                    "RMSNorm handoff buffer is too small: requires ",
+                    required_handoff_size,
+                    " bytes, but the process buffer has ",
+                    rmsnorm_handoff_buffer_size,
+                    " bytes");
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueRMSNormDescriptorCreate(&stats_descriptor));
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueRMSNormDescriptorSetBuffer(
+            stats_descriptor, d_rmsnorm_handoff_buffer, required_handoff_size));
+    }
+
+    void* residual_pointer        = residual.has_value() ? residual->data_ptr() : nullptr;
+    void* residual_output_pointer = residual_out.has_value() ? residual_out->data_ptr() : nullptr;
+    void* gamma_pointer           = gamma.has_value() ? gamma->data_ptr() : nullptr;
+    void* requant_scale_pointer =
+        requant_scale_out.has_value() ? requant_scale_out->data_ptr() : nullptr;
+    hipblasLtFusedEpilogueDescriptor_t producer = nullptr;
+    build_producer_epilogue(stage_kinds,
+                            residual_pointer,
+                            residual_output_pointer,
+                            gamma_pointer,
+                            static_cast<float>(eps),
+                            requant_scale_pointer,
+                            requant_scale_mode,
+                            intermediate_type,
+                            stats_descriptor,
+                            producer);
+    {
+        // Translate to hipBLASLt API descriptors.
+        const int64_t M = k2;
+        const int64_t N = m;
+        const int64_t K = k1;
+        const void* A   = mat2.data_ptr();
+        const void* B   = mat1.data_ptr();
+        void* D         = intermediate.data_ptr();
+        void* C         = D; // beta == 0; hipBLASLt still requires non-null C.
+
+        CHECK_HIPBLAS_ERROR(run_tn_fused(mat2_type,
+                                         mat1_type,
+                                         intermediate_type,
+                                         M,
+                                         N,
+                                         K,
+                                         A,
+                                         mat2_scale.has_value() ? mat2_scale->data_ptr() : nullptr,
+                                         B,
+                                         mat1_scale.has_value() ? mat1_scale->data_ptr() : nullptr,
+                                         C,
+                                         D,
+                                         producer,
+                                         stream,
+                                         solution_index1,
+                                         mat2_scale_mode,
+                                         mat1_scale_mode));
+    }
+    CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueDestroy(producer));
+
+    hipblasLtFusedEpilogueDescriptor_t consumer = nullptr;
+    if(has_rmsnorm)
+    {
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueCreate(&consumer));
+        CHECK_HIPBLAS_ERROR(
+            hipblasLtFusedEpilogueAdd(consumer, HIPBLASLT_FUSEABLE_EPILOGUE_RMSNORM_SCALE_APPLY));
+        CHECK_HIPBLAS_ERROR(
+            hipblasLtFusedEpilogueSetAttribute(consumer,
+                                               HIPBLASLT_FUSED_EPILOGUE_RMSNORM_STATS,
+                                               &stats_descriptor,
+                                               sizeof(stats_descriptor)));
+    }
+    const void* intermediate_scale = has_requant ? requant_scale_pointer : nullptr;
+    {
+        // Translate to hipBLASLt API descriptors.
+        const int64_t M = n;
+        const int64_t N = m;
+        const int64_t K = k2;
+        const void* A   = mat3.data_ptr();
+        const void* B   = intermediate.data_ptr();
+        void* D         = gemm_out.data_ptr();
+        void* C         = D; // beta == 0; hipBLASLt still requires non-null C.
+
+        CHECK_HIPBLAS_ERROR(
+            run_tn_fused(mat3_type,
+                         intermediate_type,
+                         gemm_out_type,
+                         M,
+                         N,
+                         K,
+                         A,
+                         mat3_scale.has_value() ? mat3_scale->data_ptr() : nullptr,
+                         B,
+                         intermediate_scale,
+                         C,
+                         D,
+                         consumer,
+                         stream,
+                         solution_index2,
+                         mat3_scale_mode,
+                         has_requant ? std::make_optional(requant_scale_mode) : std::nullopt));
+    }
+    if(consumer != nullptr)
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueDestroy(consumer));
+    if(stats_descriptor != nullptr)
+        CHECK_HIPBLAS_ERROR(hipblasLtFusedEpilogueRMSNormDescriptorDestroy(stats_descriptor));
+#else
+    AITER_CHECK(false,
+                "hipb_mm_epilogue_mm requires a hipBLASLt build with the fused epilogue API");
+#endif
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void hipb_create_extension()
 {
     aiter_detail::g_aiter_can_throw = true;
@@ -1531,6 +2053,9 @@ void hipb_create_extension()
     // hipBLASLt
     CHECK_HIPBLAS_ERROR(hipblasLtCreate(&hipblaslt_handle));
     CHECK_HIP_ERROR(hipMalloc(&d_workspace, workspace_size));
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 5)
+    CHECK_HIP_ERROR(hipMalloc(&d_rmsnorm_handoff_buffer, rmsnorm_handoff_buffer_size));
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
     CHECK_HIPBLAS_ERROR(
         hipblasLtMatmulPreferenceSetAttribute(preference,
@@ -1560,6 +2085,10 @@ void hipb_destroy_extension()
     CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
     CHECK_HIP_ERROR(hipFree(d_workspace));
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 5)
+    CHECK_HIP_ERROR(hipFree(d_rmsnorm_handoff_buffer));
+    d_rmsnorm_handoff_buffer = nullptr;
+#endif
 
     hipblaslt_handle = nullptr;
     preference       = nullptr;
@@ -1619,4 +2148,27 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("scaleA_mode") = std::nullopt,
           py::arg("scaleB_mode") = std::nullopt);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
+    m.def("hipb_mm_epilogue_mm",
+          &hipb_mm_epilogue_mm,
+          "Managed GEMM, fused epilogue stages, and GEMM pair",
+          py::arg("mat1"),
+          py::arg("mat2"),
+          py::arg("mat3"),
+          py::arg("stage_kinds"),
+          py::arg("residual"),
+          py::arg("residual_out"),
+          py::arg("gamma"),
+          py::arg("eps"),
+          py::arg("requant_scale_out"),
+          py::arg("requant_scale_mode"),
+          py::arg("intermediate"),
+          py::arg("gemm_out"),
+          py::arg("mat1_scale"),
+          py::arg("mat2_scale"),
+          py::arg("mat3_scale"),
+          py::arg("mat1_scale_mode"),
+          py::arg("mat2_scale_mode"),
+          py::arg("mat3_scale_mode"),
+          py::arg("solution_index1"),
+          py::arg("solution_index2"));
 }
